@@ -3,7 +3,6 @@ import logging
 import base64
 import asyncio
 import httpx
-from io import BytesIO
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -27,9 +26,9 @@ if not TELEGRAM_BOT_TOKEN or not OPENROUTER_API_KEY:
     raise ValueError("Missing required environment variables: TELEGRAM_BOT_TOKEN and OPENROUTER_API_KEY")
 
 
-# Global dict to store pending media groups during batching
-# Format: {media_group_id: {'chat_id': int, 'photos': [file_id, ...], 'task': asyncio.Task}}
-pending_media_groups = {}
+# Global dict to store pending photo groups
+# Format: {media_group_id: {'chat_id': int, 'file_ids': [file_id, ...]}}
+pending_groups = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -55,118 +54,124 @@ Just send a screenshot and I'll do the rest! 📸"""
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photo messages - check for media group and batch if needed."""
+    """Handle photo messages - batch multiple photos or process single photo."""
     media_group_id = update.message.media_group_id
+    chat_id = update.effective_chat.id
+    file_id = update.message.photo[-1].file_id
     
     if media_group_id:
-        # This photo is part of a media group (multiple photos sent at once)
-        chat_id = update.effective_chat.id
-        photo_file_id = update.message.photo[-1].file_id
+        # This photo is part of a batch (multiple photos sent together)
+        logger.info(f"Received photo with media_group_id: {media_group_id}")
         
-        if media_group_id not in pending_media_groups:
-            # First photo in this group - initialize and schedule processing
-            pending_media_groups[media_group_id] = {
+        if media_group_id not in pending_groups:
+            # First photo of this batch - initialize and schedule processing
+            pending_groups[media_group_id] = {
                 'chat_id': chat_id,
-                'photos': [photo_file_id],
-                'task': None
+                'file_ids': [file_id]
             }
-            # Schedule processing after 1.5 second buffer (wait for other photos to arrive)
-            task = asyncio.create_task(process_media_group(media_group_id, context))
-            pending_media_groups[media_group_id]['task'] = task
-            logger.info(f"Started collecting media group {media_group_id}, got photo 1")
+            logger.info(f"Started collecting batch {media_group_id}, photo 1 received")
+            
+            # Schedule the batch processing task
+            asyncio.create_task(process_group(media_group_id, context))
         else:
-            # Add this photo to the existing group
-            pending_media_groups[media_group_id]['photos'].append(photo_file_id)
-            logger.info(f"Added photo to media group {media_group_id}, total photos: {len(pending_media_groups[media_group_id]['photos'])}")
+            # Additional photo in this batch - just add to list
+            pending_groups[media_group_id]['file_ids'].append(file_id)
+            logger.info(f"Added photo to batch {media_group_id}, total photos: {len(pending_groups[media_group_id]['file_ids'])}")
     else:
         # Single photo (no media group) - process immediately
         await process_single_photo(update, context)
 
 
-async def process_media_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process all photos in a media group after waiting for collection."""
-    # Wait 1.5 seconds to collect all photos in the group
-    await asyncio.sleep(1.5)
+async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process all photos in a media group batch."""
+    # Wait 2 seconds for all photos in the group to arrive
+    await asyncio.sleep(2)
     
-    if media_group_id not in pending_media_groups:
-        logger.warning(f"Media group {media_group_id} not found in pending groups")
+    if media_group_id not in pending_groups:
+        logger.warning(f"Media group {media_group_id} was removed before processing")
         return
     
-    group_data = pending_media_groups.pop(media_group_id)
+    group_data = pending_groups.pop(media_group_id)
     chat_id = group_data['chat_id']
-    photos = group_data['photos']
+    file_ids = group_data['file_ids']
+    total = len(file_ids)
+    
+    logger.info(f"Processing batch {media_group_id} with {total} photos")
     
     try:
-        # Send processing status message
-        processing_msg = await context.bot.send_message(
+        # Send status message
+        status_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🔄 Analyzing {len(photos)} screenshot{'s' if len(photos) > 1 else ''}..."
+            text=f"⏳ {total} screenshot{'s' if total > 1 else ''} analyze ho rahe hain... wait karo"
         )
         
-        logger.info(f"Processing media group {media_group_id} with {len(photos)} photos")
-        
         # Download and analyze each photo
-        listings = []
-        for i, file_id in enumerate(photos, 1):
+        all_listings = []
+        for i, file_id in enumerate(file_ids, 1):
             try:
+                # Download photo
                 file_info = await context.bot.get_file(file_id)
                 photo_bytes = await file_info.download_as_bytearray()
                 base64_image = base64.standard_b64encode(bytes(photo_bytes)).decode('utf-8')
                 
-                # Send to OpenRouter Vision API
+                logger.info(f"Downloaded photo {i}/{total} from batch {media_group_id}")
+                
+                # Get listing from OpenRouter
                 listing = await get_listing_from_openrouter(base64_image)
-                listings.append(listing)
-                logger.info(f"Analyzed photo {i}/{len(photos)} from media group {media_group_id}")
+                all_listings.append(listing)
+                logger.info(f"Analyzed photo {i}/{total} from batch {media_group_id}")
                 
             except httpx.HTTPStatusError as e:
-                logger.error(f"OpenRouter API error for photo {i} in media group {media_group_id}: {e.response.status_code}")
-                listings.append(f"❌ **OpenRouter API Error** (Photo {i})\nPlease try again later.")
+                logger.error(f"OpenRouter API error for photo {i} in batch {media_group_id}: {e.response.status_code}")
+                all_listings.append(f"❌ **OpenRouter API Error** (Photo {i})\nPlease try again later.")
             except Exception as e:
-                logger.error(f"Error analyzing photo {i} from media group {media_group_id}: {str(e)}")
-                listings.append(f"❌ **Error analyzing photo {i}**\n{str(e)[:80]}")
+                logger.error(f"Error processing photo {i} in batch {media_group_id}: {str(e)}")
+                all_listings.append(f"❌ **Error analyzing photo {i}**\n{str(e)[:80]}")
         
-        # Combine all listings into one message
-        combined_message = ""
-        for i, listing in enumerate(listings, 1):
-            combined_message += f"━━━━━━━━━━━━━━━━━━━\n📸 ACCOUNT {i} of {len(listings)}\n━━━━━━━━━━━━━━━━━━━\n{listing}\n\n"
+        # Combine all listings into ONE message
+        final_message = ""
+        for i, listing in enumerate(all_listings, 1):
+            final_message += f"━━━━━━━━━━━━━━━━━━━\n📸 **Account {i} of {total}**\n━━━━━━━━━━━━━━━━━━━\n{listing}\n\n"
         
-        # Delete the processing message
+        # Delete the status message
         try:
-            await processing_msg.delete()
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         except TelegramError:
             pass
         
-        # Send the combined reply
-        await context.bot.send_message(chat_id=chat_id, text=combined_message, parse_mode='HTML')
-        logger.info(f"Sent combined reply for media group {media_group_id} with {len(photos)} account(s)")
+        # Send the combined results in ONE message
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=final_message.strip(),
+            parse_mode='HTML'
+        )
+        logger.info(f"Sent combined reply for batch {media_group_id} with {total} account(s)")
         
     except Exception as e:
-        logger.error(f"Unexpected error processing media group {media_group_id}: {str(e)}")
+        logger.error(f"Unexpected error processing batch {media_group_id}: {str(e)}")
         try:
             await context.bot.send_message(
-                chat_id=group_data['chat_id'],
+                chat_id=chat_id,
                 text=f"❌ **Unexpected Error**\n{str(e)[:100]}"
             )
         except TelegramError:
-            logger.error(f"Failed to send error message for media group {media_group_id}")
+            logger.error(f"Failed to send error message for batch {media_group_id}")
 
 
 async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process a single photo (not part of a media group)."""
+    """Process a single photo (not part of a batch)."""
     try:
-        # Notify user we're processing
+        # Send processing message
         processing_msg = await update.message.reply_text("🔄 Analyzing screenshot...")
         
-        # Download photo
+        # Download and analyze photo
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-        
-        # Convert to base64
         base64_image = base64.standard_b64encode(bytes(photo_bytes)).decode('utf-8')
         
-        logger.info(f"Downloaded photo from user {update.effective_user.id}, size: {len(photo_bytes)} bytes")
+        logger.info(f"Downloaded single photo from user {update.effective_user.id}, size: {len(photo_bytes)} bytes")
         
-        # Call OpenRouter Vision API
+        # Get listing from OpenRouter
         listing = await get_listing_from_openrouter(base64_image)
         
         # Delete processing message
@@ -175,17 +180,23 @@ async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         except TelegramError:
             pass
         
-        # Reply with the listing
+        # Send the listing
         await update.message.reply_text(listing, parse_mode='HTML')
         logger.info(f"Sent listing to user {update.effective_user.id}")
         
     except httpx.HTTPStatusError as e:
-        logger.error(f"OpenRouter API error for user {update.effective_user.id}: {e.response.status_code} - {e.response.text}")
-        await handle_error(update, "API Error", "❌ **OpenRouter API Error**\nThe API returned an error. Please try again later.")
-        
+        logger.error(f"OpenRouter API error for user {update.effective_user.id}: {e.response.status_code}")
+        try:
+            await update.message.reply_text("❌ **OpenRouter API Error**\nPlease try again later.")
+        except TelegramError:
+            pass
+            
     except Exception as e:
-        logger.error(f"Error processing photo for user {update.effective_user.id}: {str(e)}")
-        await handle_error(update, "Processing Error", f"❌ **Error Processing Screenshot**\n{str(e)[:100]}")
+        logger.error(f"Error processing single photo for user {update.effective_user.id}: {str(e)}")
+        try:
+            await update.message.reply_text(f"❌ **Error Processing Screenshot**\n{str(e)[:80]}")
+        except TelegramError:
+            pass
 
 
 
@@ -237,14 +248,6 @@ async def get_listing_from_openrouter(base64_image: str) -> str:
         listing = data['choices'][0]['message']['content'].strip()
         logger.info(f"Received response from OpenRouter: {len(listing)} characters")
         return listing
-
-
-async def handle_error(update: Update, error_type: str, message: str) -> None:
-    """Handle and send error messages to user."""
-    try:
-        await update.message.reply_text(message)
-    except TelegramError as e:
-        logger.error(f"Failed to send error message to user {update.effective_user.id}: {str(e)}")
 
 
 def main() -> None:
