@@ -26,9 +26,11 @@ if not TELEGRAM_BOT_TOKEN or not OPENROUTER_API_KEY:
     raise ValueError("Missing required environment variables: TELEGRAM_BOT_TOKEN and OPENROUTER_API_KEY")
 
 
-# Global dict to store pending photo groups
-# Format: {media_group_id: {'chat_id': int, 'file_ids': [file_id, ...]}}
+# Global dicts for media group batching
+# Format: {media_group_id: [file_id, file_id, ...]}
 pending_groups = {}
+# Format: set of media_group_ids already scheduled for processing (one task per group)
+scheduled_groups = set()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -63,39 +65,39 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # This photo is part of a batch (multiple photos sent together)
         logger.info(f"Received photo with media_group_id: {media_group_id}")
         
+        # Always add file_id to pending group
         if media_group_id not in pending_groups:
-            # First photo of this batch - initialize and schedule processing
-            pending_groups[media_group_id] = {
-                'chat_id': chat_id,
-                'file_ids': [file_id]
-            }
-            logger.info(f"Started collecting batch {media_group_id}, photo 1 received")
-            
-            # Schedule the batch processing task
-            asyncio.create_task(process_group(media_group_id, context))
+            pending_groups[media_group_id] = []
+        pending_groups[media_group_id].append(file_id)
+        
+        # Only schedule ONE task per media_group_id (use scheduled_groups flag)
+        if media_group_id not in scheduled_groups:
+            scheduled_groups.add(media_group_id)
+            logger.info(f"Scheduled processing for batch {media_group_id}")
+            asyncio.create_task(process_group_after_delay(media_group_id, chat_id, context))
         else:
-            # Additional photo in this batch - just add to list
-            pending_groups[media_group_id]['file_ids'].append(file_id)
-            logger.info(f"Added photo to batch {media_group_id}, total photos: {len(pending_groups[media_group_id]['file_ids'])}")
+            logger.info(f"Batch {media_group_id} already scheduled, added photo #{len(pending_groups[media_group_id])}")
     else:
         # Single photo (no media group) - process immediately
         await process_single_photo(update, context)
 
 
-async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process all photos in a media group batch."""
+async def process_group_after_delay(media_group_id: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process all photos in a media group batch after waiting for collection."""
     # Wait 2 seconds for all photos in the group to arrive
     await asyncio.sleep(2)
     
-    if media_group_id not in pending_groups:
-        logger.warning(f"Media group {media_group_id} was removed before processing")
+    # Mark as no longer scheduled
+    scheduled_groups.discard(media_group_id)
+    
+    # Get all file_ids for this group
+    file_ids = pending_groups.pop(media_group_id, [])
+    
+    if not file_ids:
+        logger.warning(f"Media group {media_group_id} has no file_ids")
         return
     
-    group_data = pending_groups.pop(media_group_id)
-    chat_id = group_data['chat_id']
-    file_ids = group_data['file_ids']
     total = len(file_ids)
-    
     logger.info(f"Processing batch {media_group_id} with {total} photos")
     
     try:
@@ -128,23 +130,14 @@ async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE)
                 logger.error(f"Error processing photo {i} in batch {media_group_id}: {str(e)}")
                 all_listings.append(f"❌ **Error analyzing photo {i}**\n{str(e)[:80]}")
         
-        # Combine all listings into ONE message
-        final_message = ""
-        for i, listing in enumerate(all_listings, 1):
-            final_message += f"━━━━━━━━━━━━━━━━━━━\n📸 **Account {i} of {total}**\n━━━━━━━━━━━━━━━━━━━\n{listing}\n\n"
-        
         # Delete the status message
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         except TelegramError:
             pass
         
-        # Send the combined results in ONE message
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=final_message.strip(),
-            parse_mode='HTML'
-        )
+        # Combine all listings and send (split if needed)
+        await send_combined_listings(context, chat_id, all_listings)
         logger.info(f"Sent combined reply for batch {media_group_id} with {total} account(s)")
         
     except Exception as e:
@@ -156,6 +149,63 @@ async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE)
             )
         except TelegramError:
             logger.error(f"Failed to send error message for batch {media_group_id}")
+
+
+async def send_combined_listings(context: ContextTypes.DEFAULT_TYPE, chat_id: int, all_listings: list) -> None:
+    """Combine listings into one or more messages (split if >4096 chars)."""
+    total = len(all_listings)
+    
+    # Build combined message
+    combined = ""
+    for i, listing in enumerate(all_listings, 1):
+        account_section = f"━━━━━━━━━━━━━━━━━━━\n📸 **Account {i} of {total}**\n━━━━━━━━━━━━━━━━━━━\n{listing}\n\n"
+        combined += account_section
+    
+    combined = combined.strip()
+    
+    # Telegram message limit is 4096 chars
+    max_message_length = 4096
+    
+    if len(combined) <= max_message_length:
+        # Single message fits
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=combined,
+            parse_mode='HTML'
+        )
+    else:
+        # Split into multiple messages
+        messages = []
+        current_message = ""
+        
+        # Split by account dividers
+        account_sections = combined.split("━━━━━━━━━━━━━━━━━━━\n📸 **Account")
+        
+        for idx, section in enumerate(account_sections):
+            if idx == 0 and section.strip():
+                # First part (shouldn't have account header)
+                prefix = "━━━━━━━━━━━━━━━━━━━\n📸 **Account" + section
+            else:
+                prefix = "━━━━━━━━━━━━━━━━━━━\n📸 **Account" + section if idx > 0 else section
+            
+            if len(current_message) + len(prefix) <= max_message_length:
+                current_message += prefix
+            else:
+                if current_message:
+                    messages.append(current_message.strip())
+                current_message = prefix
+        
+        if current_message:
+            messages.append(current_message.strip())
+        
+        # Send all split messages
+        for msg in messages:
+            if msg:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    parse_mode='HTML'
+                )
 
 
 async def process_single_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
